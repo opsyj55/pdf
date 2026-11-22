@@ -97,12 +97,19 @@ def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
 
 
 def booklet_pdf(src, dst, sheet_w_pt, sheet_h_pt, margin_pt=0.0, gutter_pt=0.0,
-                mode="fit", progress=None):
+                mode="fit", progress=None, which="all", reverse_backs=False,
+                rotate_backs=False):
     """Impose `src` as a folded booklet: two pages per sheet side, in folding order.
 
     Each sheet side is sheet_w x sheet_h; the left and right halves each hold one page.
     Pages are pushed toward the fold so any spare space ends up on the outer edges.
     Page count is padded with blanks to a multiple of 4.
+
+    which = "all"   -> every sheet side in order (front1, back1, front2, back2, ...)
+            "front" -> only the fronts (sheet sides 1, 3, 5, ...)
+            "back"  -> only the backs  (sheet sides 2, 4, 6, ...)
+    reverse_backs -> output the backs in reverse order
+    rotate_backs  -> turn the back sides 180 degrees (for how you re-feed the paper)
     """
     reader = PdfReader(src)
     if reader.is_encrypted:
@@ -126,8 +133,14 @@ def booklet_pdf(src, dst, sheet_w_pt, sheet_h_pt, margin_pt=0.0, gutter_pt=0.0,
     )
     y_min, y_max = margin_pt, H - margin_pt
 
+    jobs = [(i, side) for i, side in enumerate(sides)
+            if which == "all" or (which == "front" and i % 2 == 0)
+            or (which == "back" and i % 2 == 1)]
+    if reverse_backs and which == "back":
+        jobs.reverse()
+
     writer = PdfWriter()
-    for k, side in enumerate(sides, 1):
+    for k, (side_idx, side) in enumerate(jobs, 1):
         sheet = writer.add_blank_page(width=W, height=H)
         for slot_idx, page_no in enumerate(side):
             page = pages[page_no]
@@ -164,12 +177,14 @@ def booklet_pdf(src, dst, sheet_w_pt, sheet_h_pt, margin_pt=0.0, gutter_pt=0.0,
                   .transform(Transformation(ctm=ctm))
                   .scale(sx, sy).translate(tx, ty))
             sheet.merge_transformed_page(page, op)
+        if rotate_backs and side_idx % 2 == 1:
+            sheet.rotate(180)
         if progress:
-            progress(k, len(sides))
+            progress(k, len(jobs))
 
     with open(dst, "wb") as f:
         writer.write(f)
-    return len(sides), n, N
+    return len(jobs), n, N
 
 
 # ------------------------------------------------------------------ printing
@@ -291,7 +306,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PDF Fit & Print")
-        self.geometry("560x700")
+        self.geometry("560x760")
         self.resizable(False, False)
 
         self.src = tk.StringVar()
@@ -302,7 +317,10 @@ class App(tk.Tk):
         self.margin = tk.StringVar(value="0")
         self.gutter = tk.StringVar(value="0")
         self.booklet = tk.BooleanVar(value=True)
-        self.duplex = tk.BooleanVar(value=True)
+        self.duplex = tk.BooleanVar(value=False)
+        self.which = tk.StringVar(value="all")
+        self.rev_backs = tk.BooleanVar(value=False)
+        self.rot_backs = tk.BooleanVar(value=False)
         self.mode = tk.StringVar(value="fit")
         self.auto_orient = tk.BooleanVar(value=True)
         self.printer = tk.StringVar()
@@ -313,7 +331,7 @@ class App(tk.Tk):
         self.after(100, self.poll)  # main thread checks messages from the worker
 
     def _build(self):
-        p = {"padx": 10, "pady": 5}
+        p = {"padx": 10, "pady": 3}
         f = ttk.Frame(self)
         f.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -354,8 +372,22 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="Auto-rotate sheet to match each page's orientation",
                         variable=self.auto_orient).pack(anchor="w", padx=10, pady=2)
 
+        man = ttk.LabelFrame(f, text="Booklet sheets to print (for manual front/back)")
+        man.grid(row=3, column=0, columnspan=4, sticky="ew", **p)
+        ttk.Radiobutton(man, text="All", variable=self.which,
+                        value="all").grid(row=0, column=0, sticky="w", padx=10)
+        ttk.Radiobutton(man, text="Fronts only (odd: 1, 3, 5…)", variable=self.which,
+                        value="front").grid(row=0, column=1, sticky="w", padx=10)
+        ttk.Radiobutton(man, text="Backs only (even: 2, 4, 6…)", variable=self.which,
+                        value="back").grid(row=0, column=2, sticky="w", padx=10)
+        ttk.Checkbutton(man, text="Reverse order of backs",
+                        variable=self.rev_backs).grid(row=1, column=0, columnspan=2,
+                                                      sticky="w", padx=10, pady=2)
+        ttk.Checkbutton(man, text="Turn backs 180°",
+                        variable=self.rot_backs).grid(row=1, column=2, sticky="w", padx=10, pady=2)
+
         prn = ttk.LabelFrame(f, text="Printer")
-        prn.grid(row=3, column=0, columnspan=4, sticky="ew", **p)
+        prn.grid(row=4, column=0, columnspan=4, sticky="ew", **p)
         names, default = list_printers()
         self.printer.set(default or (names[0] if names else ""))
         ttk.Label(prn, text="Printer:").grid(row=0, column=0, sticky="w", **p)
@@ -373,12 +405,12 @@ class App(tk.Tk):
                       ).grid(row=3, column=0, columnspan=2, sticky="w", padx=10)
 
         self.progress = ttk.Progressbar(f, mode="determinate")
-        self.progress.grid(row=4, column=0, columnspan=4, sticky="ew", **p)
+        self.progress.grid(row=5, column=0, columnspan=4, sticky="ew", **p)
         self.status = ttk.Label(f, text="Choose a PDF to begin.")
-        self.status.grid(row=5, column=0, columnspan=4, sticky="w", **p)
+        self.status.grid(row=6, column=0, columnspan=4, sticky="w", **p)
 
         bf = ttk.Frame(f)
-        bf.grid(row=6, column=0, columnspan=4, pady=10)
+        bf.grid(row=7, column=0, columnspan=4, pady=8)
         self.btn_save = ttk.Button(bf, text="Save resized PDF…", command=lambda: self.run("save"))
         self.btn_print = ttk.Button(bf, text="Print", command=lambda: self.run("print"))
         self.btn_preview = ttk.Button(bf, text="Preview", command=lambda: self.run("preview"))
@@ -439,8 +471,10 @@ class App(tk.Tk):
 
         if action == "save":
             base = os.path.splitext(os.path.basename(src))[0]
+            tag = {"front": "_fronts", "back": "_backs"}.get(self.which.get(), "_resized") \
+                if self.booklet.get() else "_resized"
             dst = filedialog.asksaveasfilename(defaultextension=".pdf",
-                                               initialfile=f"{base}_resized.pdf",
+                                               initialfile=f"{base}{tag}.pdf",
                                                filetypes=[("PDF files", "*.pdf")])
             if not dst:
                 return
@@ -453,7 +487,9 @@ class App(tk.Tk):
         self.status.config(text="Working… large PDFs can take a minute.")
         opts = dict(mode=self.mode.get(), auto=self.auto_orient.get(),
                     printer=self.printer.get(), custom=self.custom_paper.get(),
-                    booklet=self.booklet.get(), gutter=g, duplex=self.duplex.get())
+                    booklet=self.booklet.get(), gutter=g, duplex=self.duplex.get(),
+                    which=self.which.get(), rev=self.rev_backs.get(),
+                    rot=self.rot_backs.get())
         threading.Thread(target=self.work, args=(action, src, dst, w, h, m, opts),
                          daemon=True).start()
 
@@ -462,7 +498,8 @@ class App(tk.Tk):
         try:
             cb = lambda i, t: self.q.put(("progress", f"Building sheet {i}/{t}…", i, t))
             if o["booklet"]:
-                n, orig, padded = booklet_pdf(src, dst, w, h, m, o["gutter"], o["mode"], cb)
+                n, orig, padded = booklet_pdf(src, dst, w, h, m, o["gutter"], o["mode"], cb,
+                                              o["which"], o["rev"], o["rot"])
             else:
                 n = resize_pdf(src, dst, w, h, m, o["mode"], o["auto"], cb)
             if action == "print":
@@ -473,7 +510,7 @@ class App(tk.Tk):
                         print_pdf_windows(
                             dst, o["printer"], o["custom"],
                             lambda i, t: self.q.put(("progress", f"Printing page {i}/{t}…", i, t)),
-                            duplex=o["duplex"] and o["booklet"])
+                            duplex=o["duplex"] and o["booklet"] and o["which"] == "all")
                     except ImportError:
                         print_fallback(dst)
                         used_fallback = True
