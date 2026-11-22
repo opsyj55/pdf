@@ -96,6 +96,82 @@ def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
     return total
 
 
+def booklet_pdf(src, dst, sheet_w_pt, sheet_h_pt, margin_pt=0.0, gutter_pt=0.0,
+                mode="fit", progress=None):
+    """Impose `src` as a folded booklet: two pages per sheet side, in folding order.
+
+    Each sheet side is sheet_w x sheet_h; the left and right halves each hold one page.
+    Pages are pushed toward the fold so any spare space ends up on the outer edges.
+    Page count is padded with blanks to a multiple of 4.
+    """
+    reader = PdfReader(src)
+    if reader.is_encrypted:
+        reader.decrypt("")
+    pages = list(reader.pages)
+    n = len(pages)
+    N = ((n + 3) // 4) * 4
+    pages += [None] * (N - n)
+
+    # saddle-stitch order: front (N-1-2i, 2i), back (2i+1, N-2-2i)
+    sides = []
+    for i in range(N // 4):
+        sides.append((N - 1 - 2 * i, 2 * i))
+        sides.append((2 * i + 1, N - 2 - 2 * i))
+
+    W, H = sheet_w_pt, sheet_h_pt
+    half = W / 2.0
+    slots = (  # (x_min, x_max) for left and right page
+        (margin_pt, half - gutter_pt / 2.0),
+        (half + gutter_pt / 2.0, W - margin_pt),
+    )
+    y_min, y_max = margin_pt, H - margin_pt
+
+    writer = PdfWriter()
+    for k, side in enumerate(sides, 1):
+        sheet = writer.add_blank_page(width=W, height=H)
+        for slot_idx, page_no in enumerate(side):
+            page = pages[page_no]
+            if page is None:
+                continue
+            box = page.cropbox
+            w, h = float(box.width), float(box.height)
+            left, bottom = float(box.left), float(box.bottom)
+            rot = (page.rotation or 0) % 360
+
+            # visible size after /Rotate, and matrix that applies it
+            if rot == 90:
+                vw, vh, ctm = h, w, (0, -1, 1, 0, 0, w)
+            elif rot == 180:
+                vw, vh, ctm = w, h, (-1, 0, 0, -1, w, h)
+            elif rot == 270:
+                vw, vh, ctm = h, w, (0, 1, -1, 0, h, 0)
+            else:
+                vw, vh, ctm = w, h, (1, 0, 0, 1, 0, 0)
+
+            x0, x1 = slots[slot_idx]
+            aw, ah = max(x1 - x0, 1), max(y_max - y_min, 1)
+            if mode == "stretch":
+                sx, sy = aw / vw, ah / vh
+                tx, ty = x0, y_min
+            else:
+                sc = min(aw / vw, ah / vh)
+                sx = sy = sc
+                ty = y_min + (ah - vh * sc) / 2
+                # left page hugs the fold (right edge of its slot); right page hugs it too
+                tx = (x1 - vw * sc) if slot_idx == 0 else x0
+
+            op = (Transformation().translate(-left, -bottom)
+                  .transform(Transformation(ctm=ctm))
+                  .scale(sx, sy).translate(tx, ty))
+            sheet.merge_transformed_page(page, op)
+        if progress:
+            progress(k, len(sides))
+
+    with open(dst, "wb") as f:
+        writer.write(f)
+    return len(sides), n, N
+
+
 # ------------------------------------------------------------------ printing
 def list_printers():
     """Return (printer names, default printer) - Windows only."""
@@ -110,7 +186,7 @@ def list_printers():
         return [], ""
 
 
-def print_pdf_windows(path, printer, use_custom_size, progress=None):
+def print_pdf_windows(path, printer, use_custom_size, progress=None, duplex=False):
     """Render each page of `path` and print it straight to `printer`.
 
     If use_custom_size is True the page's own size is requested from the printer
@@ -141,6 +217,9 @@ def print_pdf_windows(path, printer, use_custom_size, progress=None):
                               | win32con.DM_PAPERLENGTH)
             dm.Orientation = 2 if w_pt > h_pt else 1  # landscape / portrait
             dm.Fields |= win32con.DM_ORIENTATION
+            if duplex:
+                dm.Duplex = 3  # DMDUP_HORIZONTAL = flip on the short edge
+                dm.Fields |= win32con.DM_DUPLEX
 
         w0, h0 = pdf[0].get_size()
         set_page_devmode(w0, h0)
@@ -212,15 +291,18 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PDF Fit & Print")
-        self.geometry("560x600")
+        self.geometry("560x700")
         self.resizable(False, False)
 
         self.src = tk.StringVar()
-        self.preset = tk.StringVar(value="A4")
-        self.width = tk.StringVar(value="210")
-        self.height = tk.StringVar(value="297")
+        self.preset = tk.StringVar(value="Custom")
+        self.width = tk.StringVar(value="600")
+        self.height = tk.StringVar(value="215")
         self.unit = tk.StringVar(value="mm")
         self.margin = tk.StringVar(value="0")
+        self.gutter = tk.StringVar(value="0")
+        self.booklet = tk.BooleanVar(value=True)
+        self.duplex = tk.BooleanVar(value=True)
         self.mode = tk.StringVar(value="fit")
         self.auto_orient = tk.BooleanVar(value=True)
         self.printer = tk.StringVar()
@@ -239,7 +321,7 @@ class App(tk.Tk):
         ttk.Entry(f, textvariable=self.src, width=40).grid(row=0, column=1, columnspan=2, sticky="ew", **p)
         ttk.Button(f, text="Browse…", command=self.pick).grid(row=0, column=3, **p)
 
-        box = ttk.LabelFrame(f, text="Target paper size")
+        box = ttk.LabelFrame(f, text="Sheet size (for a booklet: both pages together)")
         box.grid(row=1, column=0, columnspan=4, sticky="ew", **p)
         ttk.Label(box, text="Preset:").grid(row=0, column=0, sticky="w", **p)
         cb = ttk.Combobox(box, textvariable=self.preset, values=list(PRESETS),
@@ -256,9 +338,15 @@ class App(tk.Tk):
                      state="readonly", width=6).grid(row=2, column=1, **p)
         ttk.Label(box, text="Margin:").grid(row=2, column=2, sticky="e", **p)
         ttk.Entry(box, textvariable=self.margin, width=9).grid(row=2, column=3, **p)
+        ttk.Label(box, text="Middle gap:").grid(row=3, column=0, sticky="w", **p)
+        ttk.Entry(box, textvariable=self.gutter, width=9).grid(row=3, column=1, **p)
+        ttk.Label(box, text="(0 = pages touch at the fold)").grid(row=3, column=2, columnspan=2,
+                                                                  sticky="w", **p)
 
         opt = ttk.LabelFrame(f, text="How to fit")
         opt.grid(row=2, column=0, columnspan=4, sticky="ew", **p)
+        ttk.Checkbutton(opt, text="Convert to booklet (2 pages per sheet, folding order)",
+                        variable=self.booklet).pack(anchor="w", padx=10, pady=2)
         ttk.Radiobutton(opt, text="Fit inside (keep proportions, centred)",
                         variable=self.mode, value="fit").pack(anchor="w", padx=10, pady=2)
         ttk.Radiobutton(opt, text="Stretch to fill (may distort)",
@@ -277,9 +365,12 @@ class App(tk.Tk):
         ttk.Checkbutton(prn, text="Ask the printer for this exact paper size",
                         variable=self.custom_paper).grid(row=1, column=0, columnspan=2,
                                                          sticky="w", padx=10, pady=2)
+        ttk.Checkbutton(prn, text="Print double-sided (flip on short edge)",
+                        variable=self.duplex).grid(row=2, column=0, columnspan=2,
+                                                   sticky="w", padx=10, pady=2)
         if not names:
             ttk.Label(prn, text="(No printer list - will use the system default)"
-                      ).grid(row=2, column=0, columnspan=2, sticky="w", padx=10)
+                      ).grid(row=3, column=0, columnspan=2, sticky="w", padx=10)
 
         self.progress = ttk.Progressbar(f, mode="determinate")
         self.progress.grid(row=4, column=0, columnspan=4, sticky="ew", **p)
@@ -339,6 +430,9 @@ class App(tk.Tk):
             return
         try:
             w, h, m = self.read_size()
+            g = float(self.gutter.get() or 0) * PT_PER[self.unit.get()]
+            if g < 0:
+                raise ValueError("Middle gap cannot be negative.")
         except ValueError as e:
             messagebox.showwarning("PDF Fit & Print", str(e))
             return
@@ -358,15 +452,19 @@ class App(tk.Tk):
         self.progress.config(value=0)
         self.status.config(text="Working… large PDFs can take a minute.")
         opts = dict(mode=self.mode.get(), auto=self.auto_orient.get(),
-                    printer=self.printer.get(), custom=self.custom_paper.get())
+                    printer=self.printer.get(), custom=self.custom_paper.get(),
+                    booklet=self.booklet.get(), gutter=g, duplex=self.duplex.get())
         threading.Thread(target=self.work, args=(action, src, dst, w, h, m, opts),
                          daemon=True).start()
 
     # ---- worker thread: never touches Tk, only puts messages on the queue ----
     def work(self, action, src, dst, w, h, m, o):
         try:
-            n = resize_pdf(src, dst, w, h, m, o["mode"], o["auto"],
-                           lambda i, t: self.q.put(("progress", f"Resizing page {i}/{t}…", i, t)))
+            cb = lambda i, t: self.q.put(("progress", f"Building sheet {i}/{t}…", i, t))
+            if o["booklet"]:
+                n, orig, padded = booklet_pdf(src, dst, w, h, m, o["gutter"], o["mode"], cb)
+            else:
+                n = resize_pdf(src, dst, w, h, m, o["mode"], o["auto"], cb)
             if action == "print":
                 self.q.put(("progress", "Sending to printer…", 0, n))
                 used_fallback = False
@@ -374,7 +472,8 @@ class App(tk.Tk):
                     try:
                         print_pdf_windows(
                             dst, o["printer"], o["custom"],
-                            lambda i, t: self.q.put(("progress", f"Printing page {i}/{t}…", i, t)))
+                            lambda i, t: self.q.put(("progress", f"Printing page {i}/{t}…", i, t)),
+                            duplex=o["duplex"] and o["booklet"])
                     except ImportError:
                         print_fallback(dst)
                         used_fallback = True
