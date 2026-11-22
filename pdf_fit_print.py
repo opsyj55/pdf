@@ -1,8 +1,12 @@
 """
 PDF Fit & Print - resize every page of a PDF to a custom paper size, then save or print.
-Requires: Python 3.8+ and pypdf   ->   pip install pypdf
+
+Printing on Windows is done directly to the chosen printer (no Adobe dialog):
+each page is rendered and sent at the custom paper size you entered.
+
+Requires: pip install pypdf pypdfium2 pillow pywin32   (pywin32 is Windows only)
 Run:      python pdf_fit_print.py
-Build:    pyinstaller --onefile --windowed pdf_fit_print.py
+Build:    pyinstaller --onefile --windowed --collect-all pypdfium2 --collect-all pypdfium2_raw pdf_fit_print.py
 """
 import os
 import sys
@@ -17,6 +21,7 @@ from tkinter import ttk, filedialog, messagebox
 from pypdf import PdfReader, PdfWriter, Transformation
 from pypdf.generic import RectangleObject
 
+IS_WIN = sys.platform.startswith("win")
 PT_PER = {"mm": 72 / 25.4, "cm": 72 / 2.54, "in": 72.0, "pt": 1.0}
 
 # name: (width, height, unit) in portrait
@@ -37,6 +42,7 @@ PRESETS = {
 LOG_FILE = os.path.join(tempfile.gettempdir(), "pdf_fit_print_log.txt")
 
 
+# ------------------------------------------------------------------ resizing
 def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
                auto_orient=True, progress=None):
     """Write a copy of `src` to `dst` with every page placed on a width x height sheet.
@@ -90,15 +96,110 @@ def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
     return total
 
 
-def send_to_printer(path):
-    if sys.platform.startswith("win"):
+# ------------------------------------------------------------------ printing
+def list_printers():
+    """Return (printer names, default printer) - Windows only."""
+    if not IS_WIN:
+        return [], ""
+    try:
+        import win32print
+        names = [p[2] for p in win32print.EnumPrinters(
+            win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
+        return names, win32print.GetDefaultPrinter()
+    except Exception:
+        return [], ""
+
+
+def print_pdf_windows(path, printer, use_custom_size, progress=None):
+    """Render each page of `path` and print it straight to `printer`.
+
+    If use_custom_size is True the page's own size is requested from the printer
+    driver as a custom paper size (works only if the driver supports it).
+    """
+    import win32con
+    import win32gui
+    import win32print
+    import win32ui
+    import pypdfium2 as pdfium
+    from PIL import ImageWin
+
+    DMPAPER_USER = 256
+    pdf = pdfium.PdfDocument(path)
+    total = len(pdf)
+
+    hprinter = win32print.OpenPrinter(printer)
+    try:
+        dm = win32print.GetPrinter(hprinter, 2)["pDevMode"]
+
+        def set_page_devmode(w_pt, h_pt):
+            if use_custom_size:
+                w_mm, h_mm = w_pt * 25.4 / 72, h_pt * 25.4 / 72
+                dm.PaperSize = DMPAPER_USER
+                dm.PaperWidth = int(round(min(w_mm, h_mm) * 10))   # tenths of a mm
+                dm.PaperLength = int(round(max(w_mm, h_mm) * 10))
+                dm.Fields |= (win32con.DM_PAPERSIZE | win32con.DM_PAPERWIDTH
+                              | win32con.DM_PAPERLENGTH)
+            dm.Orientation = 2 if w_pt > h_pt else 1  # landscape / portrait
+            dm.Fields |= win32con.DM_ORIENTATION
+
+        w0, h0 = pdf[0].get_size()
+        set_page_devmode(w0, h0)
+        handle = win32gui.CreateDC("WINSPOOL", printer, dm)
+        hdc = win32ui.CreateDCFromHandle(handle)
+        hdc.StartDoc("PDF Fit & Print")
+        try:
+            for i in range(total):
+                page = pdf[i]
+                w_pt, h_pt = page.get_size()
+                if i > 0:
+                    set_page_devmode(w_pt, h_pt)
+                    try:
+                        win32gui.ResetDC(hdc.GetSafeHdc(), dm)
+                    except Exception:
+                        pass  # keep previous page settings
+                hdc.StartPage()
+
+                horz = hdc.GetDeviceCaps(win32con.HORZRES)
+                vert = hdc.GetDeviceCaps(win32con.VERTRES)
+                dpi = min(hdc.GetDeviceCaps(win32con.LOGPIXELSX) or 300, 300)
+                scale = dpi / 72.0
+                # keep memory sane on very large sheets (max ~60 megapixels)
+                px = (w_pt * scale) * (h_pt * scale)
+                if px > 60e6:
+                    scale *= (60e6 / px) ** 0.5
+                img = page.render(scale=scale).to_pil().convert("RGB")
+
+                r = min(horz / img.width, vert / img.height)
+                dw, dh = int(img.width * r), int(img.height * r)
+                x0, y0 = (horz - dw) // 2, (vert - dh) // 2
+                ImageWin.Dib(img).draw(hdc.GetHandleOutput(), (x0, y0, x0 + dw, y0 + dh))
+                hdc.EndPage()
+                if progress:
+                    progress(i + 1, total)
+            hdc.EndDoc()
+        except BaseException:
+            try:
+                hdc.AbortDoc()
+            except Exception:
+                pass
+            raise
+        finally:
+            hdc.DeleteDC()
+    finally:
+        win32print.ClosePrinter(hprinter)
+    return total
+
+
+def print_fallback(path):
+    """No pywin32 / not Windows: hand the file to the system."""
+    if IS_WIN:
         os.startfile(path, "print")  # default PDF app, default printer
     else:
         subprocess.check_call(["lp", path])
 
 
 def open_file(path):
-    if sys.platform.startswith("win"):
+    if IS_WIN:
         os.startfile(path)
     elif sys.platform == "darwin":
         subprocess.Popen(["open", path])
@@ -106,11 +207,12 @@ def open_file(path):
         subprocess.Popen(["xdg-open", path])
 
 
+# ------------------------------------------------------------------ GUI
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PDF Fit & Print")
-        self.geometry("560x520")
+        self.geometry("560x600")
         self.resizable(False, False)
 
         self.src = tk.StringVar()
@@ -121,6 +223,8 @@ class App(tk.Tk):
         self.margin = tk.StringVar(value="0")
         self.mode = tk.StringVar(value="fit")
         self.auto_orient = tk.BooleanVar(value=True)
+        self.printer = tk.StringVar()
+        self.custom_paper = tk.BooleanVar(value=True)
         self.busy = False
         self.q = queue.Queue()
         self._build()
@@ -162,13 +266,28 @@ class App(tk.Tk):
         ttk.Checkbutton(opt, text="Auto-rotate sheet to match each page's orientation",
                         variable=self.auto_orient).pack(anchor="w", padx=10, pady=2)
 
+        prn = ttk.LabelFrame(f, text="Printer")
+        prn.grid(row=3, column=0, columnspan=4, sticky="ew", **p)
+        names, default = list_printers()
+        self.printer.set(default or (names[0] if names else ""))
+        ttk.Label(prn, text="Printer:").grid(row=0, column=0, sticky="w", **p)
+        ttk.Combobox(prn, textvariable=self.printer, values=names,
+                     state="readonly" if names else "disabled",
+                     width=42).grid(row=0, column=1, sticky="w", **p)
+        ttk.Checkbutton(prn, text="Ask the printer for this exact paper size",
+                        variable=self.custom_paper).grid(row=1, column=0, columnspan=2,
+                                                         sticky="w", padx=10, pady=2)
+        if not names:
+            ttk.Label(prn, text="(No printer list - will use the system default)"
+                      ).grid(row=2, column=0, columnspan=2, sticky="w", padx=10)
+
         self.progress = ttk.Progressbar(f, mode="determinate")
-        self.progress.grid(row=3, column=0, columnspan=4, sticky="ew", **p)
+        self.progress.grid(row=4, column=0, columnspan=4, sticky="ew", **p)
         self.status = ttk.Label(f, text="Choose a PDF to begin.")
-        self.status.grid(row=4, column=0, columnspan=4, sticky="w", **p)
+        self.status.grid(row=5, column=0, columnspan=4, sticky="w", **p)
 
         bf = ttk.Frame(f)
-        bf.grid(row=5, column=0, columnspan=4, pady=10)
+        bf.grid(row=6, column=0, columnspan=4, pady=10)
         self.btn_save = ttk.Button(bf, text="Save resized PDF…", command=lambda: self.run("save"))
         self.btn_print = ttk.Button(bf, text="Print", command=lambda: self.run("print"))
         self.btn_preview = ttk.Button(bf, text="Preview", command=lambda: self.run("preview"))
@@ -238,16 +357,33 @@ class App(tk.Tk):
         self.set_buttons(False)
         self.progress.config(value=0)
         self.status.config(text="Working… large PDFs can take a minute.")
-        mode, auto = self.mode.get(), self.auto_orient.get()
-        threading.Thread(target=self.work, args=(action, src, dst, w, h, m, mode, auto),
+        opts = dict(mode=self.mode.get(), auto=self.auto_orient.get(),
+                    printer=self.printer.get(), custom=self.custom_paper.get())
+        threading.Thread(target=self.work, args=(action, src, dst, w, h, m, opts),
                          daemon=True).start()
 
     # ---- worker thread: never touches Tk, only puts messages on the queue ----
-    def work(self, action, src, dst, w, h, m, mode, auto):
+    def work(self, action, src, dst, w, h, m, o):
         try:
-            n = resize_pdf(src, dst, w, h, m, mode, auto,
-                           lambda i, t: self.q.put(("progress", i, t)))
-            self.q.put(("done", action, dst, n))
+            n = resize_pdf(src, dst, w, h, m, o["mode"], o["auto"],
+                           lambda i, t: self.q.put(("progress", f"Resizing page {i}/{t}…", i, t)))
+            if action == "print":
+                self.q.put(("progress", "Sending to printer…", 0, n))
+                used_fallback = False
+                if IS_WIN and o["printer"]:
+                    try:
+                        print_pdf_windows(
+                            dst, o["printer"], o["custom"],
+                            lambda i, t: self.q.put(("progress", f"Printing page {i}/{t}…", i, t)))
+                    except ImportError:
+                        print_fallback(dst)
+                        used_fallback = True
+                else:
+                    print_fallback(dst)
+                    used_fallback = True
+                self.q.put(("done", action, dst, n, used_fallback))
+            else:
+                self.q.put(("done", action, dst, n, False))
         except BaseException as e:
             try:
                 with open(LOG_FILE, "w", encoding="utf-8") as f:
@@ -262,11 +398,11 @@ class App(tk.Tk):
             while True:
                 msg = self.q.get_nowait()
                 if msg[0] == "progress":
-                    _, i, t = msg
-                    self.progress.config(maximum=t, value=i)
-                    self.status.config(text=f"Resizing page {i}/{t}…")
+                    _, text, i, t = msg
+                    self.progress.config(maximum=max(t, 1), value=i)
+                    self.status.config(text=text)
                 elif msg[0] == "done":
-                    self.finish(msg[1], msg[2], msg[3])
+                    self.finish(*msg[1:])
                 elif msg[0] == "error":
                     self.busy = False
                     self.set_buttons(True)
@@ -276,26 +412,23 @@ class App(tk.Tk):
             pass
         self.after(100, self.poll)
 
-    def finish(self, action, dst, n):
+    def finish(self, action, dst, n, used_fallback):
         self.busy = False
         self.set_buttons(True)
-        self.status.config(text=f"Done - {n} page(s) resized.")
         try:
             if action == "print":
-                send_to_printer(dst)
-                self.status.config(text="Sent to printer.")
+                self.status.config(text=f"Sent {n} page(s) to the printer.")
+                if used_fallback:
+                    messagebox.showinfo("Print", "Sent to your default PDF app for printing.")
             elif action == "preview":
+                self.status.config(text=f"Done - {n} page(s) resized.")
                 open_file(dst)
             else:
+                self.status.config(text=f"Done - {n} page(s) resized.")
                 if messagebox.askyesno("Saved", f"Saved to:\n{dst}\n\nOpen it now?"):
                     open_file(dst)
-        except Exception:
-            # Direct printing not available - open in viewer so user can press Ctrl+P
-            try:
-                open_file(dst)
-            except Exception:
-                pass
-            messagebox.showinfo("Print", "Opened the resized PDF - use Print from the viewer.")
+        except Exception as e:
+            messagebox.showerror("PDF Fit & Print", str(e))
 
 
 if __name__ == "__main__":
