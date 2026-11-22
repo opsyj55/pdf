@@ -51,6 +51,8 @@ def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
     total = len(reader.pages)
 
     for idx, page in enumerate(reader.pages, 1):
+        # Attach the page to the writer FIRST (required by pypdf 7+), then edit it
+        page = writer.add_page(page)
         page.transfer_rotation_to_content()  # bake /Rotate into the content
         box = page.cropbox  # visible area (defaults to mediabox)
         w, h = float(box.width), float(box.height)
@@ -74,14 +76,12 @@ def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
               .scale(sx, sy).translate(tx, ty))
         page.add_transformation(op)
 
-        new_box = RectangleObject([0, 0, W, H])
-        page.mediabox = new_box
+        page.mediabox = RectangleObject([0, 0, W, H])
         page.cropbox = RectangleObject([0, 0, W, H])
         page.trimbox = RectangleObject([0, 0, W, H])
         page.bleedbox = RectangleObject([0, 0, W, H])
         page.artbox = RectangleObject([0, 0, W, H])
 
-        writer.add_page(page)
         if progress:
             progress(idx, total)
 
