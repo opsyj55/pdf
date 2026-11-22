@@ -6,13 +6,16 @@ Build:    pyinstaller --onefile --windowed pdf_fit_print.py
 """
 import os
 import sys
-import subprocess
+import queue
 import tempfile
 import threading
+import traceback
+import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from pypdf import PdfReader, PdfWriter, PageObject, Transformation
+from pypdf import PdfReader, PdfWriter, Transformation
+from pypdf.generic import RectangleObject
 
 PT_PER = {"mm": 72 / 25.4, "cm": 72 / 2.54, "in": 72.0, "pt": 1.0}
 
@@ -31,6 +34,8 @@ PRESETS = {
     "ID card (85.6 x 54 mm)": (54, 85.6, "mm"),
 }
 
+LOG_FILE = os.path.join(tempfile.gettempdir(), "pdf_fit_print_log.txt")
+
 
 def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
                auto_orient=True, progress=None):
@@ -47,9 +52,9 @@ def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
 
     for idx, page in enumerate(reader.pages, 1):
         page.transfer_rotation_to_content()  # bake /Rotate into the content
-        mb = page.mediabox
-        w, h = float(mb.width), float(mb.height)
-        left, bottom = float(mb.left), float(mb.bottom)
+        box = page.cropbox  # visible area (defaults to mediabox)
+        w, h = float(box.width), float(box.height)
+        left, bottom = float(box.left), float(box.bottom)
 
         W, H = width_pt, height_pt
         if auto_orient and ((w > h) != (W > H)):
@@ -65,11 +70,18 @@ def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
             tx = (W - w * s) / 2
             ty = (H - h * s) / 2
 
-        sheet = PageObject.create_blank_page(width=W, height=H)
         op = (Transformation().translate(-left, -bottom)
               .scale(sx, sy).translate(tx, ty))
-        sheet.merge_transformed_page(page, op)
-        writer.add_page(sheet)
+        page.add_transformation(op)
+
+        new_box = RectangleObject([0, 0, W, H])
+        page.mediabox = new_box
+        page.cropbox = RectangleObject([0, 0, W, H])
+        page.trimbox = RectangleObject([0, 0, W, H])
+        page.bleedbox = RectangleObject([0, 0, W, H])
+        page.artbox = RectangleObject([0, 0, W, H])
+
+        writer.add_page(page)
         if progress:
             progress(idx, total)
 
@@ -81,8 +93,6 @@ def resize_pdf(src, dst, width_pt, height_pt, margin_pt=0.0, mode="fit",
 def send_to_printer(path):
     if sys.platform.startswith("win"):
         os.startfile(path, "print")  # default PDF app, default printer
-    elif sys.platform == "darwin":
-        subprocess.check_call(["lp", path])
     else:
         subprocess.check_call(["lp", path])
 
@@ -112,7 +122,9 @@ class App(tk.Tk):
         self.mode = tk.StringVar(value="fit")
         self.auto_orient = tk.BooleanVar(value=True)
         self.busy = False
+        self.q = queue.Queue()
         self._build()
+        self.after(100, self.poll)  # main thread checks messages from the worker
 
     def _build(self):
         p = {"padx": 10, "pady": 5}
@@ -163,6 +175,11 @@ class App(tk.Tk):
         for b in (self.btn_save, self.btn_preview, self.btn_print):
             b.pack(side="left", padx=6)
         f.columnconfigure(1, weight=1)
+
+    def set_buttons(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for b in (self.btn_save, self.btn_print, self.btn_preview):
+            b.config(state=state)
 
     def pick(self):
         path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
@@ -218,28 +235,50 @@ class App(tk.Tk):
             dst = os.path.join(tempfile.gettempdir(), "pdf_fit_print_temp.pdf")
 
         self.busy = True
-        for b in (self.btn_save, self.btn_print, self.btn_preview):
-            b.config(state="disabled")
-        threading.Thread(target=self.work, args=(action, src, dst, w, h, m), daemon=True).start()
+        self.set_buttons(False)
+        self.progress.config(value=0)
+        self.status.config(text="Working… large PDFs can take a minute.")
+        mode, auto = self.mode.get(), self.auto_orient.get()
+        threading.Thread(target=self.work, args=(action, src, dst, w, h, m, mode, auto),
+                         daemon=True).start()
 
-    def work(self, action, src, dst, w, h, m):
-        def prog(i, n):
-            self.after(0, lambda: (self.progress.config(maximum=n, value=i),
-                                   self.status.config(text=f"Resizing page {i}/{n}…")))
+    # ---- worker thread: never touches Tk, only puts messages on the queue ----
+    def work(self, action, src, dst, w, h, m, mode, auto):
         try:
-            n = resize_pdf(src, dst, w, h, m, self.mode.get(), self.auto_orient.get(), prog)
-            self.after(0, lambda: self.finish(action, dst, n, None))
-        except Exception as e:
-            self.after(0, lambda: self.finish(action, dst, 0, str(e)))
+            n = resize_pdf(src, dst, w, h, m, mode, auto,
+                           lambda i, t: self.q.put(("progress", i, t)))
+            self.q.put(("done", action, dst, n))
+        except BaseException as e:
+            try:
+                with open(LOG_FILE, "w", encoding="utf-8") as f:
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass
+            self.q.put(("error", f"{type(e).__name__}: {e}\n\nDetails saved to:\n{LOG_FILE}"))
 
-    def finish(self, action, dst, n, err):
+    # ---- main thread: reads messages and updates the window ----
+    def poll(self):
+        try:
+            while True:
+                msg = self.q.get_nowait()
+                if msg[0] == "progress":
+                    _, i, t = msg
+                    self.progress.config(maximum=t, value=i)
+                    self.status.config(text=f"Resizing page {i}/{t}…")
+                elif msg[0] == "done":
+                    self.finish(msg[1], msg[2], msg[3])
+                elif msg[0] == "error":
+                    self.busy = False
+                    self.set_buttons(True)
+                    self.status.config(text="Failed.")
+                    messagebox.showerror("PDF Fit & Print", msg[1])
+        except queue.Empty:
+            pass
+        self.after(100, self.poll)
+
+    def finish(self, action, dst, n):
         self.busy = False
-        for b in (self.btn_save, self.btn_print, self.btn_preview):
-            b.config(state="normal")
-        if err:
-            self.status.config(text="Failed.")
-            messagebox.showerror("PDF Fit & Print", err)
-            return
+        self.set_buttons(True)
         self.status.config(text=f"Done - {n} page(s) resized.")
         try:
             if action == "print":
@@ -252,7 +291,10 @@ class App(tk.Tk):
                     open_file(dst)
         except Exception:
             # Direct printing not available - open in viewer so user can press Ctrl+P
-            open_file(dst)
+            try:
+                open_file(dst)
+            except Exception:
+                pass
             messagebox.showinfo("Print", "Opened the resized PDF - use Print from the viewer.")
 
 
